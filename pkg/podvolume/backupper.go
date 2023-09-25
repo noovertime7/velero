@@ -137,6 +137,7 @@ func newBackupper(
 						log.Errorf("No results channel found for pod %s/%s to send pod volume backup %s/%s on", pvb.Spec.Pod.Namespace, pvb.Spec.Pod.Name, pvb.Namespace, pvb.Name)
 						return
 					}
+					// Notice 如果pod是已经完成或者失败的状态，将结果放到resChan中
 					resChan <- pvb
 				}
 			},
@@ -166,17 +167,20 @@ func (b *backupper) getMatchAction(resPolicies *resourcepolicies.Policies, pvc *
 	return nil, errors.Errorf("failed to check resource policies for empty volume")
 }
 
+// Notice 这里只是为了创建podVolume CRD，node-agent会持续watch CRD，node-agent是真正完成备份数据卷的人
 func (b *backupper) BackupPodVolumes(backup *velerov1api.Backup, pod *corev1api.Pod, volumesToBackup []string, resPolicies *resourcepolicies.Policies, log logrus.FieldLogger) ([]*velerov1api.PodVolumeBackup, *PVCBackupSummary, []error) {
 	if len(volumesToBackup) == 0 {
 		return nil, nil, nil
 	}
 	log.Infof("pod %s/%s has volumes to backup: %v", pod.Namespace, pod.Name, volumesToBackup)
 
+	// Notice 检查一下这个节点的node-agent有没在运行
 	err := nodeagent.IsRunningInNode(b.ctx, backup.Namespace, pod.Spec.NodeName, b.podClient)
 	if err != nil {
 		return nil, nil, []error{err}
 	}
 
+	// Notice 获取uploader的类型 Restic/kopia
 	repositoryType := getRepositoryType(b.uploaderType)
 	if repositoryType == "" {
 		err := errors.Errorf("empty repository type, uploader %s", b.uploaderType)
@@ -203,7 +207,7 @@ func (b *backupper) BackupPodVolumes(backup *velerov1api.Backup, pod *corev1api.
 		errs              []error
 		podVolumeBackups  []*velerov1api.PodVolumeBackup
 		podVolumes        = make(map[string]corev1api.Volume)
-		mountedPodVolumes = sets.String{}
+		mountedPodVolumes = sets.String{} // Notice 存储所有容器内的挂载路径
 	)
 	pvcSummary := NewPVCBackupSummary()
 
@@ -220,6 +224,7 @@ func (b *backupper) BackupPodVolumes(backup *velerov1api.Backup, pod *corev1api.
 		}
 	}
 
+	// Notice 1.11 新增功能
 	if err := kube.IsPodRunning(pod); err != nil {
 		for _, volumeName := range volumesToBackup {
 			err := errors.Wrapf(err, "backup for volume %s is skipped", volumeName)
