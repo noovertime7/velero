@@ -188,6 +188,7 @@ func (kb *kubernetesBackupper) BackupWithResolvers(log logrus.FieldLogger,
 	backupFile io.Writer,
 	backupItemActionResolver framework.BackupItemActionResolverV2,
 	volumeSnapshotterGetter VolumeSnapshotterGetter) error {
+	// Notice 生成tar Writer
 	gzippedData := gzip.NewWriter(backupFile)
 	defer gzippedData.Close()
 
@@ -199,6 +200,7 @@ func (kb *kubernetesBackupper) BackupWithResolvers(log logrus.FieldLogger,
 		return errors.WithStack(err)
 	}
 
+	// Notice 构造IncludedNamespaces ExcludedNamespaces,去重
 	backupRequest.NamespaceIncludesExcludes = getNamespaceIncludesExcludes(backupRequest.Backup)
 	log.Infof("Including namespaces: %s", backupRequest.NamespaceIncludesExcludes.IncludesString())
 	log.Infof("Excluding namespaces: %s", backupRequest.NamespaceIncludesExcludes.ExcludesString())
@@ -236,6 +238,7 @@ func (kb *kubernetesBackupper) BackupWithResolvers(log logrus.FieldLogger,
 
 	backupRequest.BackedUpItems = map[itemKey]struct{}{}
 
+	// Notice 解析是否存在超时时间 velero.io/pod-volume-timeout
 	podVolumeTimeout := kb.podVolumeTimeout
 	if val := backupRequest.Annotations[velerov1api.PodVolumeOperationTimeoutAnnotation]; val != "" {
 		parsed, err := time.ParseDuration(val)
@@ -276,6 +279,7 @@ func (kb *kubernetesBackupper) BackupWithResolvers(log logrus.FieldLogger,
 		pageSize:              kb.clientPageSize,
 	}
 
+	// Notice 获取需要备份的文件
 	items := collector.getAllItems()
 	log.WithField("progress", "").Infof("Collected %d items matching the backup spec from the Kubernetes API (actual number of items backed up may be more or less depending on velero.io/exclude-from-backup annotation, plugins returning additional related items to back up, etc.)", len(items))
 
@@ -325,6 +329,7 @@ func (kb *kubernetesBackupper) BackupWithResolvers(log logrus.FieldLogger,
 	// but it will not issue a patch if it hasn't received a new
 	// update since the previous patch. This goroutine exits
 	// when it receives on the 'quit' channel.
+	// Notice 主要是为了更新数据的备份进度
 	go func() {
 		ticker := time.NewTicker(1 * time.Second)
 		var lastUpdate *progressUpdate

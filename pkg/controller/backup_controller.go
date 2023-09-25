@@ -68,21 +68,21 @@ type backupReconciler struct {
 	ctx                         context.Context
 	logger                      logrus.FieldLogger
 	discoveryHelper             discovery.Helper
-	backupper                   pkgbackup.Backupper
-	kbClient                    kbclient.Client
+	backupper                   pkgbackup.Backupper // Notice： 备份接口 真正干活的
+	kbClient                    kbclient.Client     // controller-runtime的客户端
 	clock                       clock.WithTickerAndDelayedExecution
-	backupLogLevel              logrus.Level
-	newPluginManager            func(logrus.FieldLogger) clientmgmt.Manager
-	backupTracker               BackupTracker
-	defaultBackupLocation       string
-	defaultVolumesToFsBackup    bool
-	defaultBackupTTL            time.Duration
-	defaultCSISnapshotTimeout   time.Duration
-	resourceTimeout             time.Duration
-	defaultItemOperationTimeout time.Duration
+	backupLogLevel              logrus.Level                                // 日志等级
+	newPluginManager            func(logrus.FieldLogger) clientmgmt.Manager // 插件的管理器 velero使用go-plugin这个库
+	backupTracker               BackupTracker                               // 保存正在备份的任务
+	defaultBackupLocation       string                                      // 默认备份存储位置的name
+	defaultVolumesToFsBackup    bool                                        // 是否是文件备份
+	defaultBackupTTL            time.Duration                               // 默认过期时间
+	defaultCSISnapshotTimeout   time.Duration                               // 快照超时时间
+	resourceTimeout             time.Duration                               // 资源超时时间
+	defaultItemOperationTimeout time.Duration                               //默认超时
 	defaultSnapshotLocations    map[string]string
 	metrics                     *metrics.ServerMetrics
-	backupStoreGetter           persistence.ObjectBackupStoreGetter
+	backupStoreGetter           persistence.ObjectBackupStoreGetter // 访问一些持久化的数据
 	formatFlag                  logging.Format
 	volumeSnapshotLister        snapshotv1listers.VolumeSnapshotLister
 	volumeSnapshotClient        snapshotterClientSet.Interface
@@ -244,6 +244,7 @@ func (b *backupReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	}
 
 	log.Debug("Preparing backup request")
+	// Notice 重点关注
 	request := b.prepareBackupRequest(original, log)
 	if len(request.Status.ValidationErrors) > 0 {
 		request.Status.Phase = velerov1api.BackupPhaseFailedValidation
@@ -269,6 +270,7 @@ func (b *backupReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		return ctrl.Result{}, nil
 	}
 
+	// Notice 要开始备份了,先在backupTracker 添加一下
 	b.backupTracker.Add(request.Namespace, request.Name)
 	defer func() {
 		switch request.Status.Phase {
@@ -281,6 +283,7 @@ func (b *backupReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 
 	b.metrics.RegisterBackupAttempt(backupScheduleName)
 
+	// Notice 重点关注,真正发起备份了
 	// execution & upload of backup
 	if err := b.runBackup(request); err != nil {
 		// even though runBackup sets the backup's phase prior
@@ -294,6 +297,7 @@ func (b *backupReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		request.Status.FailureReason = err.Error()
 	}
 
+	// Notice 备份完成 需要根据任务判断是否备份成功,更新metrics与status
 	switch request.Status.Phase {
 	case velerov1api.BackupPhaseCompleted:
 		b.metrics.RegisterBackupSuccess(backupScheduleName)
@@ -315,6 +319,11 @@ func (b *backupReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	return ctrl.Result{}, nil
 }
 
+// Notice
+// 1、填充默认值
+// 2、查询备份存储位置
+// 3、将设置了velero.io/exclude-from-backup": "true" 标签的命名空间添加到ExcludedNamespaces中
+// 4、获取configmap的资源策略
 func (b *backupReconciler) prepareBackupRequest(backup *velerov1api.Backup, logger logrus.FieldLogger) *pkgbackup.Request {
 	request := &pkgbackup.Request{
 		Backup:           backup.DeepCopy(), // don't modify items in the cache
@@ -379,6 +388,7 @@ func (b *backupReconciler) prepareBackupRequest(backup *velerov1api.Backup, logg
 		serverSpecified = true
 	}
 
+	// Notice 查询备份存储位置
 	// get the storage location, and store the BackupStorageLocation API obj on the request
 	storageLocation := &velerov1api.BackupStorageLocation{}
 	if err := b.kbClient.Get(context.Background(), kbclient.ObjectKey{
@@ -433,6 +443,8 @@ func (b *backupReconciler) prepareBackupRequest(backup *velerov1api.Backup, logg
 
 	// Add namespaces with label velero.io/exclude-from-backup=true into request.Spec.ExcludedNamespaces
 	// Essentially, adding the label velero.io/exclude-from-backup=true to a namespace would be equivalent to setting spec.ExcludedNamespaces
+
+	// Notice: 将设置了velero.io/exclude-from-backup": "true" 标签的命名空间添加到ExcludedNamespaces中
 	namespaces := corev1api.NamespaceList{}
 	if err := b.kbClient.List(context.Background(), &namespaces, kbclient.MatchingLabels{"velero.io/exclude-from-backup": "true"}); err == nil {
 		for _, ns := range namespaces.Items {
@@ -476,6 +488,7 @@ func (b *backupReconciler) prepareBackupRequest(backup *velerov1api.Backup, logg
 		request.Status.ValidationErrors = append(request.Status.ValidationErrors, "encountered labelSelector as well as orLabelSelectors in backup spec, only one can be specified")
 	}
 
+	// Notice： 获取config的资源策略
 	if request.Spec.ResourcePolicy != nil && request.Spec.ResourcePolicy.Kind == resourcepolicies.ConfigmapRefType {
 		policiesConfigmap := &corev1api.ConfigMap{}
 		err := b.kbClient.Get(context.Background(), kbclient.ObjectKey{Namespace: request.Namespace, Name: request.Spec.ResourcePolicy.Name}, policiesConfigmap)
@@ -628,6 +641,7 @@ func (b *backupReconciler) runBackup(backup *pkgbackup.Request) error {
 	defer closeAndRemoveFile(backupFile, backupLog)
 
 	backupLog.Info("Setting up plugin manager")
+	// Notice 重点关注 插件
 	pluginManager := b.newPluginManager(backupLog)
 	defer pluginManager.CleanupClients()
 
@@ -637,11 +651,13 @@ func (b *backupReconciler) runBackup(backup *pkgbackup.Request) error {
 		return err
 	}
 	backupLog.Info("Setting up backup store to check for backup existence")
+	// Notice 实际上也是调用的插件
 	backupStore, err := b.backupStoreGetter.Get(backup.StorageLocation, pluginManager, backupLog)
 	if err != nil {
 		return err
 	}
 
+	// Notice 检查S3中是否存在这个备份了,S3会有备份任务名称的文件夹
 	exists, err := backupStore.BackupExists(backup.StorageLocation.Spec.StorageType.ObjectStorage.Bucket, backup.Name)
 	if exists || err != nil {
 		backup.Status.Phase = velerov1api.BackupPhaseFailed
